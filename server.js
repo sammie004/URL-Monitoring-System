@@ -2,7 +2,6 @@
 const dotenv = require("dotenv");
 const express = require("express");
 const cors = require("cors");
-const cron = require("node-cron");
 
 const app = express();
 dotenv.config();
@@ -10,17 +9,10 @@ dotenv.config();
 // DB
 const db = require("./config/db");
 
+
 // monitoring service
-const {monitorUrls} = require("./services/URLMonitoringService");
-
-// run immediately (test)
-monitorUrls();
-
-// cron job (every 10 seconds for testing)
-cron.schedule("*/10 * * * * *", () => {
-  console.log("🔥 CRON RUNNING:", new Date().toISOString());
-  monitorUrls();
-});
+const monitor = require("./services/URLMonitoringService");
+monitor.start();
 
 // routes
 const userAuthRoutes = require("./routes/users/authentication");
