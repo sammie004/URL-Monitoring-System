@@ -4,115 +4,95 @@ const { generateWelcomeEmail } = require("../Templates/MailSending");
 const { sendEmail } = require("../services/Email");
 
 const verifyOTP = async (req, res) => {
-  const { otp, signup_token } = req.body;
 
-  // ✅ Input validation
-  if (!otp || !signup_token) {
-    return res.status(400).json({
-      success: false,
-      message: "OTP and signup token are required.",
-    });
-  }
+    // ✅ prevent crash if req.body is undefined
+  const { otp, signup_token } = req.body ;
+  console.log(`${req.body}`)
 
-  let decoded;
+    try {
+        // ✅ Verify JWT
+        const decoded = jwt.verify(signup_token, process.env.JWT_SECRET);
 
-  try {
-    // ✅ Verify token
-    decoded = jwt.verify(signup_token, process.env.JWT_SECRET);
-  } catch (err) {
-    console.error("JWT Error:", err.message);
-
-    return res.status(400).json({
-      success: false,
-      message: "Invalid or expired signup token.",
-    });
-  }
-
-  try {
-    // ✅ Ensure OTP exists in token
-    if (!decoded.otp) {
-      return res.status(400).json({
-        success: false,
-        message: "OTP not found in token.",
-      });
-    }
-
-    // ✅ Compare OTP safely
-    if (decoded.otp.toString() !== otp.toString()) {
-      return res.status(400).json({
-        success: false,
-        message: "Invalid OTP.",
-      });
-    }
-
-    // ✅ Check if user already exists
-    const checkUserQuery = "SELECT id FROM users WHERE email = ?";
-
-    db.query(checkUserQuery, [decoded.email], async (err, existingUser) => {
-      if (err) {
-        console.error("DB check error:", err);
-        return res.status(500).json({
-          success: false,
-          message: "Database error.",
-        });
-      }
-
-      if (existingUser.length > 0) {
-        return res.status(409).json({
-          success: false,
-          message: "User already exists.",
-        });
-      }
-
-      // ✅ Insert user
-      const insertQuery = `
-        INSERT INTO users (name, email, password)
-        VALUES (?, ?, ?)
-      `;
-
-      db.query(
-        insertQuery,
-        [decoded.name, decoded.email, decoded.password],
-        async (err, result) => {
-          if (err) {
-            console.error("Insert error:", err);
-            return res.status(500).json({
-              success: false,
-              message: "Error creating user.",
+        // ✅ Ensure OTP exists
+        if (!decoded.otp) {
+            return res.status(400).json({
+                message: "OTP not found in token."
             });
-          }
-
-          // ✅ Send welcome email (non-blocking but safe)
-          try {
-            const welcomeHTML = generateWelcomeEmail(decoded.name);
-
-            await sendEmail(
-              decoded.email,
-              "Welcome to URL Monitoring System 🎉",
-              welcomeHTML
-            );
-
-            console.log("✅ Welcome email sent");
-          } catch (mailErr) {
-            console.error("❌ Email failed:", mailErr.message);
-            // Don't fail request because of email
-          }
-
-          return res.status(201).json({
-            success: true,
-            message: "Account verified successfully. Welcome aboard!",
-          });
         }
-      );
-    });
-  } catch (error) {
-    console.error("Verification error:", error);
 
-    return res.status(500).json({
-      success: false,
-      message: "Something went wrong during verification.",
-    });
-  }
+        // ✅ Compare OTP safely
+        if (decoded.otp.toString() !== otp.toString()) {
+            return res.status(400).json({
+                message: "Invalid OTP"
+            });
+        }
+
+        // ✅ Check if user already exists (prevents duplicates)
+        const checkQuery = "SELECT id FROM users WHERE email = ?";
+
+        db.query(checkQuery, [decoded.email], (err, existingUser) => {
+            if (err) {
+                console.log("DB check error:", err);
+                return res.status(500).json({
+                    message: "Database error."
+                });
+            }
+
+            if (existingUser.length > 0) {
+                return res.status(409).json({
+                    message: "User already exists."
+                });
+            }
+
+            // ✅ Insert user
+            const insert_query = `
+                INSERT INTO users (name, email, password)
+                VALUES (?, ?, ?)
+            `;
+
+            db.query(
+                insert_query,
+                [decoded.name, decoded.email, decoded.password],
+                async (err, result) => {
+
+                    if (err) {
+                        console.log("Insert error:", err);
+                        return res.status(500).json({
+                            message: "Error creating user."
+                        });
+                    }
+
+                    // ✅ Send email WITHOUT breaking request if it fails
+                    try {
+                        const welcomeHTML = generateWelcomeEmail(decoded.name);
+
+                        await sendEmail(
+                            decoded.email,
+                            "Welcome to URL Monitoring System 🎉",
+                            welcomeHTML
+                        );
+
+                        console.log("✅ Welcome email sent");
+                    } catch (mailErr) {
+                        console.log("❌ Email error:", mailErr.message);
+                    }
+
+                    return res.status(201).json({
+                        message: "Account verified successfully. Welcome aboard!"
+                    });
+                }
+            );
+        });
+
+    } catch (error) {
+        console.log("OTP verification error:", error.message);
+
+        return res.status(400).json({
+            message: "Invalid or expired signup token."
+        });
+    }
 };
 
-module.exports = { verifyOTP };
+module.exports = {
+    verifyOTP
+};
