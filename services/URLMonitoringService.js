@@ -2,9 +2,10 @@
  * URLMonitoringService.js
  * Production-ready URL monitoring with structured logging,
  * retry logic, timeouts, circuit breaking, and graceful shutdown.
+ * Email alerts based on url_logs history — source of truth approach.
  */
 
-console.log("✅ URLMonitoringService version: WITH_OWNER_LOGS_AND_EMAIL");
+console.log("✅ URLMonitoringService version: LOGS_BASED_ALERTS");
 
 "use strict";
 
@@ -14,27 +15,25 @@ const { sendEmail } = require("../services/Email");
 const { generateDownAlertEmail } = require("../Templates/DownTime");
 const { generateRecoveryEmail } = require("../Templates/UpTime");
 
-// ─── Logger ──────────────────────────────────────────────────────────────────
+// ─── Logger ───────────────────────────────────────────────────────────────────
 
 const LOG_LEVELS = { DEBUG: 0, INFO: 1, WARN: 2, ERROR: 3 };
 const CURRENT_LOG_LEVEL = LOG_LEVELS[process.env.LOG_LEVEL?.toUpperCase()] ?? LOG_LEVELS.INFO;
 
 const logger = {
   _format(level, message, meta = {}) {
-    const entry = {
+    return JSON.stringify({
       timestamp: new Date().toISOString(),
       level,
       message,
       service: "URLMonitoringService",
       ...(Object.keys(meta).length > 0 && { meta }),
-    };
-    return JSON.stringify(entry);
+    });
   },
-
-  debug(message, meta)  { if (CURRENT_LOG_LEVEL <= LOG_LEVELS.DEBUG) console.debug(this._format("DEBUG", message, meta)); },
-  info(message, meta)   { if (CURRENT_LOG_LEVEL <= LOG_LEVELS.INFO)  console.log(this._format("INFO",  message, meta)); },
-  warn(message, meta)   { if (CURRENT_LOG_LEVEL <= LOG_LEVELS.WARN)  console.warn(this._format("WARN",  message, meta)); },
-  error(message, meta)  { if (CURRENT_LOG_LEVEL <= LOG_LEVELS.ERROR) console.error(this._format("ERROR", message, meta)); },
+  debug(message, meta) { if (CURRENT_LOG_LEVEL <= LOG_LEVELS.DEBUG) console.debug(this._format("DEBUG", message, meta)); },
+  info(message, meta)  { if (CURRENT_LOG_LEVEL <= LOG_LEVELS.INFO)  console.log(this._format("INFO",  message, meta)); },
+  warn(message, meta)  { if (CURRENT_LOG_LEVEL <= LOG_LEVELS.WARN)  console.warn(this._format("WARN",  message, meta)); },
+  error(message, meta) { if (CURRENT_LOG_LEVEL <= LOG_LEVELS.ERROR) console.error(this._format("ERROR", message, meta)); },
 };
 
 // ─── Config ───────────────────────────────────────────────────────────────────
@@ -135,13 +134,14 @@ async function pingUrl(url) {
   } catch (err) {
     clearTimeout(timeoutHandle);
     const responseTime = Date.now() - start;
-    const isTimeout = err.name === "AbortError";
 
     return {
       status:      "down",
       statusCode:  0,
       responseTime,
-      error:       isTimeout ? `Timed out after ${CONFIG.FETCH_TIMEOUT_MS}ms` : err.message,
+      error:       err.name === "AbortError"
+                     ? `Timed out after ${CONFIG.FETCH_TIMEOUT_MS}ms`
+                     : err.message,
     };
   }
 }
@@ -158,10 +158,10 @@ async function pingWithRetry(url, urlId) {
 
     logger.debug("Ping attempt complete", {
       url, urlId, attempt,
-      status: lastResult.status,
-      statusCode: lastResult.statusCode,
+      status:       lastResult.status,
+      statusCode:   lastResult.statusCode,
       responseTime: lastResult.responseTime,
-      error: lastResult.error,
+      error:        lastResult.error,
     });
 
     if (lastResult.status === "up") return lastResult;
@@ -175,20 +175,45 @@ async function pingWithRetry(url, urlId) {
   return lastResult;
 }
 
+// ─── Get Previous Log ─────────────────────────────────────────────────────────
+// Fetches the most recent url_log entry for this url_id.
+// Returns null if this is the very first check.
+
+async function getPreviousLog(urlId) {
+  try {
+    const rows = await query(
+      `SELECT status_code, error_message, checked_at
+       FROM url_logs
+       WHERE url_id = ?
+       ORDER BY checked_at DESC
+       LIMIT 1`,
+      [urlId]
+    );
+    return rows.length > 0 ? rows[0] : null;
+  } catch (err) {
+    logger.error("Failed to fetch previous log", { urlId, error: err.message });
+    return null; // fail open — don't block the check
+  }
+}
+
 // ─── Email Alerts ─────────────────────────────────────────────────────────────
 
-async function sendAlertIfNeeded({ urlId, url, userName, userEmail, previousStatus, previousStatusCode, newStatus, newStatusCode }) {
-  const isFirstCheck  = previousStatus === null;
-  const statusChanged = !isFirstCheck && previousStatus !== newStatus;
-  const codeChanged   = !isFirstCheck && previousStatusCode !== newStatusCode;
+async function sendAlertIfNeeded({ urlId, url, userName, userEmail, previousLog, newStatusCode, newStatus }) {
+  const isFirstCheck  = previousLog === null;
+  const statusChanged = !isFirstCheck && previousLog.status_code !== newStatusCode;
 
-  if (!isFirstCheck && !statusChanged && !codeChanged) return;
+  if (!isFirstCheck && !statusChanged) {
+    logger.debug("No alert needed — status unchanged", { urlId, url, statusCode: newStatusCode });
+    return;
+  }
+
+  const reason = isFirstCheck ? "first_check" : "status_code_change";
 
   const subject = isFirstCheck
     ? `PulseWatch — First check: ${url} is ${newStatus.toUpperCase()} (${newStatusCode})`
     : newStatus === "up"
-      ? `✅ PulseWatch — ${url} is back online`
-      : `🚨 PulseWatch — ${url} is DOWN`;
+      ? `✅ PulseWatch — ${url} is back online (${previousLog.status_code} → ${newStatusCode})`
+      : `🚨 PulseWatch — ${url} is DOWN (${previousLog.status_code} → ${newStatusCode})`;
 
   const html = newStatus === "up"
     ? generateRecoveryEmail(userName, url)
@@ -197,13 +222,13 @@ async function sendAlertIfNeeded({ urlId, url, userName, userEmail, previousStat
   try {
     await sendEmail(userEmail, subject, html);
     logger.info("Alert email sent", {
-      urlId, url,
-      to: userEmail,
-      reason: isFirstCheck ? "first_check" : statusChanged ? "status_change" : "code_change",
-      previousStatus,
-      newStatus,
-      previousStatusCode,
+      urlId,
+      url,
+      to:                  userEmail,
+      reason,
+      previousStatusCode:  isFirstCheck ? null : previousLog.status_code,
       newStatusCode,
+      newStatus,
     });
   } catch (err) {
     logger.error("Failed to send alert email", { urlId, url, to: userEmail, error: err.message });
@@ -212,7 +237,7 @@ async function sendAlertIfNeeded({ urlId, url, userName, userEmail, previousStat
 
 // ─── Core: Process One URL ────────────────────────────────────────────────────
 
-async function processUrl({ id, url, user_name, user_email, current_status, last_status_code }) {
+async function processUrl({ id, url, user_name, user_email }) {
   if (isCircuitOpen(id)) {
     logger.warn("Skipping URL — circuit open", {
       urlId:       id,
@@ -223,6 +248,18 @@ async function processUrl({ id, url, user_name, user_email, current_status, last
     return;
   }
 
+  // ── Fetch previous log before pinging ─────────────────────────────────────
+  const previousLog = await getPreviousLog(id);
+
+  logger.debug("Previous log fetched", {
+    urlId:             id,
+    url,
+    isFirstCheck:      previousLog === null,
+    previousStatusCode: previousLog?.status_code ?? null,
+    previousCheckedAt:  previousLog?.checked_at  ?? null,
+  });
+
+  // ── Ping ──────────────────────────────────────────────────────────────────
   const result = await pingWithRetry(url, id);
 
   if (result.status === "up") {
@@ -247,16 +284,15 @@ async function processUrl({ id, url, user_name, user_email, current_status, last
     });
   }
 
-  // ── Email alert ───────────────────────────────────────────────────────────
+  // ── Email alert (log-based) ───────────────────────────────────────────────
   await sendAlertIfNeeded({
-    urlId:              id,
+    urlId:       id,
     url,
-    userName:           user_name,
-    userEmail:          user_email,
-    previousStatus:     current_status   ?? null,
-    previousStatusCode: last_status_code ?? null,
-    newStatus:          result.status,
-    newStatusCode:      result.statusCode,
+    userName:    user_name,
+    userEmail:   user_email,
+    previousLog,                  // null = first check
+    newStatusCode: result.statusCode,
+    newStatus:     result.status,
   });
 
   // ── Persist log ───────────────────────────────────────────────────────────
@@ -270,11 +306,11 @@ async function processUrl({ id, url, user_name, user_email, current_status, last
     logger.error("Failed to insert url_log", { urlId: id, url, error: err.message, sqlState: err.sqlState });
   }
 
-  // ── Update current status ─────────────────────────────────────────────────
+  // ── Update urls table ─────────────────────────────────────────────────────
   try {
     await query(
-      `UPDATE urls SET status = ?, last_checked = NOW(), last_response_time_ms = ?, last_status_code = ? WHERE id = ?`,
-      [result.status, result.responseTime, result.statusCode, id]
+      `UPDATE urls SET status = ?, last_checked = NOW(), last_response_time_ms = ? WHERE id = ?`,
+      [result.status, result.responseTime, id]
     );
   } catch (err) {
     logger.error("Failed to update url status", { urlId: id, url, error: err.message });
@@ -324,10 +360,8 @@ const monitorUrls = async () => {
         u.id,
         u.url,
         u.user_id,
-        u.status           AS current_status,
-        u.last_status_code,
-        usr.name           AS user_name,
-        usr.email          AS user_email
+        usr.name  AS user_name,
+        usr.email AS user_email
       FROM urls u
       INNER JOIN users usr ON usr.id = u.user_id
     `);
@@ -345,7 +379,6 @@ const monitorUrls = async () => {
 
   logger.info("Starting URL checks", { count: urls.length, concurrency: CONFIG.CONCURRENCY_LIMIT });
 
-  // Log every URL + owner being checked
   urls.forEach(({ id, url, user_name, user_email }) => {
     logger.info("Queued for check", { urlId: id, url, owner_name: user_name, owner_email: user_email });
   });
