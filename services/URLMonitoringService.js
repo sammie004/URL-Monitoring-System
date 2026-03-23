@@ -2,18 +2,24 @@
  * URLMonitoringService.js
  * Production-ready URL monitoring with structured logging,
  * retry logic, timeouts, circuit breaking, and graceful shutdown.
- * Email alerts based on url_logs history — source of truth approach.
+ *
+ * Email strategy:
+ *   0 changes in a tick  → no email
+ *   1 change             → individual down/recovery template
+ *   2+ changes           → batched digest email per user
  */
 
-console.log("✅ URLMonitoringService version: LOGS_BASED_ALERTS");
+console.log("✅ URLMonitoringService version: BATCHED_DIGEST_ALERTS");
 
 "use strict";
 
 const cron = require("node-cron");
-const db = require("../config/db");
-const { sendEmail } = require("../services/Email");
-const { generateDownAlertEmail } = require("../Templates/DownTime");
+const db   = require("../config/db");
+
+const { sendEmail }             = require("../services/Email");
+const { generateDownAlertEmail} = require("../Templates/DownTime");
 const { generateRecoveryEmail } = require("../Templates/UpTime");
+const { generateDigestEmail }   = require("../Templates/DigestEmail");
 
 // ─── Logger ───────────────────────────────────────────────────────────────────
 
@@ -30,10 +36,10 @@ const logger = {
       ...(Object.keys(meta).length > 0 && { meta }),
     });
   },
-  debug(message, meta) { if (CURRENT_LOG_LEVEL <= LOG_LEVELS.DEBUG) console.debug(this._format("DEBUG", message, meta)); },
-  info(message, meta)  { if (CURRENT_LOG_LEVEL <= LOG_LEVELS.INFO)  console.log(this._format("INFO",  message, meta)); },
-  warn(message, meta)  { if (CURRENT_LOG_LEVEL <= LOG_LEVELS.WARN)  console.warn(this._format("WARN",  message, meta)); },
-  error(message, meta) { if (CURRENT_LOG_LEVEL <= LOG_LEVELS.ERROR) console.error(this._format("ERROR", message, meta)); },
+  debug(msg, meta) { if (CURRENT_LOG_LEVEL <= LOG_LEVELS.DEBUG) console.debug(this._format("DEBUG", msg, meta)); },
+  info(msg, meta)  { if (CURRENT_LOG_LEVEL <= LOG_LEVELS.INFO)  console.log(this._format("INFO",  msg, meta)); },
+  warn(msg, meta)  { if (CURRENT_LOG_LEVEL <= LOG_LEVELS.WARN)  console.warn(this._format("WARN",  msg, meta)); },
+  error(msg, meta) { if (CURRENT_LOG_LEVEL <= LOG_LEVELS.ERROR) console.error(this._format("ERROR", msg, meta)); },
 };
 
 // ─── Config ───────────────────────────────────────────────────────────────────
@@ -77,7 +83,6 @@ function getCircuit(urlId) {
 function isCircuitOpen(urlId) {
   const circuit = getCircuit(urlId);
   if (circuit.openedAt === null) return false;
-
   const elapsed = Date.now() - circuit.openedAt;
   if (elapsed >= CONFIG.CIRCUIT_RESET_MS) {
     circuit.openedAt = null;
@@ -89,20 +94,18 @@ function isCircuitOpen(urlId) {
 }
 
 function recordCircuitSuccess(urlId) {
-  const circuit = getCircuit(urlId);
-  circuit.failures = 0;
-  circuit.openedAt = null;
+  const c = getCircuit(urlId);
+  c.failures = 0;
+  c.openedAt = null;
 }
 
 function recordCircuitFailure(urlId) {
-  const circuit = getCircuit(urlId);
-  circuit.failures += 1;
-  if (circuit.failures >= CONFIG.CIRCUIT_BREAK_AFTER && circuit.openedAt === null) {
-    circuit.openedAt = Date.now();
+  const c = getCircuit(urlId);
+  c.failures += 1;
+  if (c.failures >= CONFIG.CIRCUIT_BREAK_AFTER && c.openedAt === null) {
+    c.openedAt = Date.now();
     logger.warn("Circuit opened — URL will be skipped until reset", {
-      urlId,
-      failures: circuit.failures,
-      resetInMs: CONFIG.CIRCUIT_RESET_MS,
+      urlId, failures: c.failures, resetInMs: CONFIG.CIRCUIT_RESET_MS,
     });
   }
 }
@@ -110,21 +113,19 @@ function recordCircuitFailure(urlId) {
 // ─── Core: Ping a URL ─────────────────────────────────────────────────────────
 
 async function pingUrl(url) {
-  const controller = new AbortController();
+  const controller    = new AbortController();
   const timeoutHandle = setTimeout(() => controller.abort(), CONFIG.FETCH_TIMEOUT_MS);
+  const start         = Date.now();
 
-  const start = Date.now();
   try {
-    const response = await fetch(url, {
+    const response    = await fetch(url, {
       method: "GET",
       signal: controller.signal,
       headers: { "User-Agent": "PulseWatch-Monitor/1.0" },
       redirect: "follow",
     });
-
     const responseTime = Date.now() - start;
     clearTimeout(timeoutHandle);
-
     return {
       status:      response.ok ? "up" : "down",
       statusCode:  typeof response.status === "number" ? response.status : 0,
@@ -133,12 +134,10 @@ async function pingUrl(url) {
     };
   } catch (err) {
     clearTimeout(timeoutHandle);
-    const responseTime = Date.now() - start;
-
     return {
       status:      "down",
       statusCode:  0,
-      responseTime,
+      responseTime: Date.now() - start,
       error:       err.name === "AbortError"
                      ? `Timed out after ${CONFIG.FETCH_TIMEOUT_MS}ms`
                      : err.message,
@@ -152,121 +151,50 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 async function pingWithRetry(url, urlId) {
   let lastResult;
-
   for (let attempt = 1; attempt <= CONFIG.MAX_RETRIES + 1; attempt++) {
     lastResult = await pingUrl(url);
-
-    logger.debug("Ping attempt complete", {
-      url, urlId, attempt,
-      status:       lastResult.status,
-      statusCode:   lastResult.statusCode,
-      responseTime: lastResult.responseTime,
-      error:        lastResult.error,
-    });
-
+    logger.debug("Ping attempt complete", { url, urlId, attempt, ...lastResult });
     if (lastResult.status === "up") return lastResult;
-
     if (attempt <= CONFIG.MAX_RETRIES) {
       logger.info("Retrying after failure", { url, urlId, attempt, error: lastResult.error });
       await sleep(CONFIG.RETRY_DELAY_MS * attempt);
     }
   }
-
   return lastResult;
 }
 
 // ─── Get Previous Log ─────────────────────────────────────────────────────────
-// Fetches the most recent url_log entry for this url_id.
-// Returns null if this is the very first check.
 
 async function getPreviousLog(urlId) {
   try {
     const rows = await query(
-      `SELECT status_code, error_message, checked_at
-       FROM url_logs
-       WHERE url_id = ?
-       ORDER BY checked_at DESC
-       LIMIT 1`,
+      `SELECT status_code, checked_at FROM url_logs
+       WHERE url_id = ? ORDER BY checked_at DESC LIMIT 1`,
       [urlId]
     );
     return rows.length > 0 ? rows[0] : null;
   } catch (err) {
     logger.error("Failed to fetch previous log", { urlId, error: err.message });
-    return null; // fail open — don't block the check
-  }
-}
-
-// ─── Email Alerts ─────────────────────────────────────────────────────────────
-
-async function sendAlertIfNeeded({ urlId, url, userName, userEmail, previousLog, newStatusCode, newStatus }) {
-  const isFirstCheck  = previousLog === null;
-  const statusChanged = !isFirstCheck && previousLog.status_code !== newStatusCode;
-
-  if (!isFirstCheck && !statusChanged) {
-    logger.debug("No alert needed — status unchanged", { urlId, url, statusCode: newStatusCode });
-    return;
-  }
-
-  const reason = isFirstCheck ? "first_check" : "status_code_change";
-
-  const subject = isFirstCheck
-    ? `PulseWatch — First check: ${url} is ${newStatus.toUpperCase()} (${newStatusCode})`
-    : newStatus === "up"
-      ? `✅ PulseWatch — ${url} is back online (${previousLog.status_code} → ${newStatusCode})`
-      : `🚨 PulseWatch — ${url} is DOWN (${previousLog.status_code} → ${newStatusCode})`;
-
-  const html = newStatus === "up"
-    ? generateRecoveryEmail(userName, url)
-    : generateDownAlertEmail(userName, url);
-
-  try {
-    await sendEmail(userEmail, subject, html);
-    logger.info("Alert email sent", {
-      urlId,
-      url,
-      to:                  userEmail,
-      reason,
-      previousStatusCode:  isFirstCheck ? null : previousLog.status_code,
-      newStatusCode,
-      newStatus,
-    });
-  } catch (err) {
-    logger.error("Failed to send alert email", { urlId, url, to: userEmail, error: err.message });
+    return null;
   }
 }
 
 // ─── Core: Process One URL ────────────────────────────────────────────────────
+// Returns a change object if something noteworthy happened, otherwise null.
 
-async function processUrl({ id, url, user_name, user_email }) {
+async function processUrl({ id, url, user_id, user_name, user_email }) {
   if (isCircuitOpen(id)) {
-    logger.warn("Skipping URL — circuit open", {
-      urlId:       id,
-      url,
-      owner_name:  user_name,
-      owner_email: user_email,
-    });
-    return;
+    logger.warn("Skipping URL — circuit open", { urlId: id, url, owner_name: user_name, owner_email: user_email });
+    return null;
   }
 
-  // ── Fetch previous log before pinging ─────────────────────────────────────
   const previousLog = await getPreviousLog(id);
-
-  logger.debug("Previous log fetched", {
-    urlId:             id,
-    url,
-    isFirstCheck:      previousLog === null,
-    previousStatusCode: previousLog?.status_code ?? null,
-    previousCheckedAt:  previousLog?.checked_at  ?? null,
-  });
-
-  // ── Ping ──────────────────────────────────────────────────────────────────
-  const result = await pingWithRetry(url, id);
+  const result      = await pingWithRetry(url, id);
 
   if (result.status === "up") {
     recordCircuitSuccess(id);
     logger.info("URL is up", {
-      urlId:        id,
-      url,
+      urlId: id, url,
       statusCode:   result.statusCode,
       responseTime: `${result.responseTime}ms`,
       owner_name:   user_name,
@@ -275,25 +203,13 @@ async function processUrl({ id, url, user_name, user_email }) {
   } else {
     recordCircuitFailure(id);
     logger.warn("URL is down", {
-      urlId:        id,
-      url,
-      statusCode:   result.statusCode,
-      error:        result.error,
-      owner_name:   user_name,
-      owner_email:  user_email,
+      urlId: id, url,
+      statusCode:  result.statusCode,
+      error:       result.error,
+      owner_name:  user_name,
+      owner_email: user_email,
     });
   }
-
-  // ── Email alert (log-based) ───────────────────────────────────────────────
-  await sendAlertIfNeeded({
-    urlId:       id,
-    url,
-    userName:    user_name,
-    userEmail:   user_email,
-    previousLog,                  // null = first check
-    newStatusCode: result.statusCode,
-    newStatus:     result.status,
-  });
 
   // ── Persist log ───────────────────────────────────────────────────────────
   try {
@@ -303,7 +219,7 @@ async function processUrl({ id, url, user_name, user_email }) {
       [id, result.statusCode, result.responseTime, result.error]
     );
   } catch (err) {
-    logger.error("Failed to insert url_log", { urlId: id, url, error: err.message, sqlState: err.sqlState });
+    logger.error("Failed to insert url_log", { urlId: id, url, error: err.message });
   }
 
   // ── Update urls table ─────────────────────────────────────────────────────
@@ -315,6 +231,27 @@ async function processUrl({ id, url, user_name, user_email }) {
   } catch (err) {
     logger.error("Failed to update url status", { urlId: id, url, error: err.message });
   }
+
+  // ── Determine if this is a noteworthy change ──────────────────────────────
+  const isFirstCheck  = previousLog === null;
+  const statusChanged = !isFirstCheck && previousLog.status_code !== result.statusCode;
+
+  if (!isFirstCheck && !statusChanged) {
+    logger.debug("No change detected — skipping alert", { urlId: id, url, statusCode: result.statusCode });
+    return null; // nothing to alert about
+  }
+
+  // Return a change record to be batched at the user level
+  return {
+    user_id,
+    user_name,
+    user_email,
+    url,
+    previousStatusCode: isFirstCheck ? null : previousLog.status_code,
+    newStatusCode:      result.statusCode,
+    newStatus:          result.status,
+    reason:             isFirstCheck ? "first_check" : "status_code_change",
+  };
 }
 
 // ─── Concurrency Limiter ──────────────────────────────────────────────────────
@@ -329,14 +266,86 @@ async function runWithConcurrency(items, limit, fn) {
       try {
         results.push(await fn(item));
       } catch (err) {
-        results.push({ error: err.message });
+        logger.error("Unhandled error in processUrl", { error: err.message });
+        results.push(null);
       }
     }
   }
 
-  const workers = Array.from({ length: Math.min(limit, items.length) }, worker);
-  await Promise.all(workers);
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
   return results;
+}
+
+// ─── Send Alerts Per User ─────────────────────────────────────────────────────
+// Groups changes by user_id, then sends:
+//   1 change  → individual down/recovery template
+//   2+ changes → digest template
+
+async function sendAlertsForTick(changes) {
+  // Filter out nulls (no change)
+  const actionable = changes.filter(Boolean);
+
+  if (actionable.length === 0) {
+    logger.info("No changes this tick — no emails to send");
+    return;
+  }
+
+  // Group by user
+  const byUser = new Map();
+  for (const change of actionable) {
+    if (!byUser.has(change.user_id)) {
+      byUser.set(change.user_id, {
+        user_name:  change.user_name,
+        user_email: change.user_email,
+        changes:    [],
+      });
+    }
+    byUser.get(change.user_id).changes.push(change);
+  }
+
+  for (const [userId, { user_name, user_email, changes: userChanges }] of byUser) {
+    try {
+      if (userChanges.length === 1) {
+        // ── Single change → individual template ──────────────────────────
+        const c       = userChanges[0];
+        const isDown  = c.newStatus === "down";
+        const subject = isDown
+          ? `🚨 PulseWatch — ${c.url} is DOWN`
+          : `✅ PulseWatch — ${c.url} is back online`;
+        const html = isDown
+          ? generateDownAlertEmail(user_name, c.url)
+          : generateRecoveryEmail(user_name, c.url);
+
+        await sendEmail(user_email, subject, html);
+        logger.info("Individual alert sent", {
+          userId, to: user_email,
+          url: c.url, reason: c.reason,
+          previousStatusCode: c.previousStatusCode,
+          newStatusCode:      c.newStatusCode,
+          newStatus:          c.newStatus,
+        });
+
+      } else {
+        // ── Multiple changes → digest ─────────────────────────────────────
+        const downCount = userChanges.filter(c => c.newStatus === "down").length;
+        const subject   = downCount > 0
+          ? `🚨 PulseWatch — ${downCount} service${downCount > 1 ? "s" : ""} down across your URLs`
+          : `✅ PulseWatch — ${userChanges.length} updates across your monitored URLs`;
+
+        const html = generateDigestEmail(user_name, userChanges);
+
+        await sendEmail(user_email, subject, html);
+        logger.info("Digest alert sent", {
+          userId, to: user_email,
+          totalChanges: userChanges.length,
+          down:         downCount,
+          recovered:    userChanges.length - downCount,
+        });
+      }
+    } catch (err) {
+      logger.error("Failed to send alert for user", { userId, to: user_email, error: err.message });
+    }
+  }
 }
 
 // ─── Main Monitor Job ─────────────────────────────────────────────────────────
@@ -383,7 +392,11 @@ const monitorUrls = async () => {
     logger.info("Queued for check", { urlId: id, url, owner_name: user_name, owner_email: user_email });
   });
 
-  await runWithConcurrency(urls, CONFIG.CONCURRENCY_LIMIT, processUrl);
+  // Check all URLs, collect change records
+  const changes = await runWithConcurrency(urls, CONFIG.CONCURRENCY_LIMIT, processUrl);
+
+  // Send emails grouped by user
+  await sendAlertsForTick(changes);
 
   const duration = Date.now() - jobStart;
   logger.info("Monitor job complete", { duration: `${duration}ms`, checked: urls.length });
@@ -396,10 +409,7 @@ const monitorUrls = async () => {
 let cronJob = null;
 
 function start() {
-  if (cronJob) {
-    logger.warn("Monitor already started");
-    return;
-  }
+  if (cronJob) { logger.warn("Monitor already started"); return; }
 
   if (!cron.validate(CONFIG.CRON_SCHEDULE)) {
     logger.error("Invalid cron schedule — monitor will not start", { schedule: CONFIG.CRON_SCHEDULE });
@@ -420,15 +430,8 @@ function stop() {
 
 // ─── Graceful Shutdown ────────────────────────────────────────────────────────
 
-process.on("SIGTERM", () => {
-  logger.info("SIGTERM received — shutting down monitor");
-  stop();
-});
-
-process.on("SIGINT", () => {
-  logger.info("SIGINT received — shutting down monitor");
-  stop();
-});
+process.on("SIGTERM", () => { logger.info("SIGTERM received — shutting down monitor"); stop(); });
+process.on("SIGINT",  () => { logger.info("SIGINT received — shutting down monitor");  stop(); });
 
 process.on("uncaughtException", (err) => {
   logger.error("Uncaught exception in monitor", { error: err.message, stack: err.stack });

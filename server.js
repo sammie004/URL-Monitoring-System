@@ -11,8 +11,8 @@ const db = require("./config/db");
 
 
 // monitoring service
-const monitor = require("./services/URLMonitoringService");
-monitor.start();
+// const monitor = require("./services/URLMonitoringService");
+// monitor.start()
 
 // routes
 const userAuthRoutes = require("./routes/users/authentication");
