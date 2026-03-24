@@ -17,8 +17,8 @@ const cron = require("node-cron");
 const db   = require("../config/db");
 
 const { sendEmail }             = require("../services/Email");
-const { generateDownAlertEmail} = require("../Templates/DownAlertEmail");
-const { generateRecoveryEmail } = require("../Templates/RecoveryEmail");
+const { generateDownAlertEmail} = require("../Templates/DownTime");
+const { generateRecoveryEmail } = require("../Templates/UpTime");
 const { generateDigestEmail }   = require("../Templates/DigestEmail");
 
 // ─── Logger ───────────────────────────────────────────────────────────────────

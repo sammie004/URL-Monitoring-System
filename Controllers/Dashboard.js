@@ -33,78 +33,108 @@ const getDashboard = (req, res) => {
 
 const getUrlLogs = (req, res) => {
   const { url_id } = req.params;
-  const user_id    = req.user.id;
+  const user_id = req.user.id;
 
   // Pull filter params from query string
-  const limit    = parseInt(req.query.limit)    || 100
-  const fromDate = req.query.from || null  // e.g. "2026-03-01"
-  const toDate   = req.query.to   || null  // e.g. "2026-03-24"
+  const limit = parseInt(req.query.limit) || 100;
+  const fromDate = req.query.from || null;
+  const toDate = req.query.to || null;
 
-  const checkQuery = `SELECT id, name, url FROM urls WHERE id = ? AND user_id = ?`
+  const checkQuery = `SELECT id, name, url FROM urls WHERE id = ? AND user_id = ?`;
   db.query(checkQuery, [url_id, user_id], (err, result) => {
-    if (err) return res.status(500).json({ message: "Error checking URL ownership." })
-    if (result.length === 0) return res.status(403).json({ message: "Unauthorized access." })
+    if (err) return res.status(500).json({ message: "Error checking URL ownership." });
+    if (result.length === 0) return res.status(403).json({ message: "Unauthorized access." });
 
-    const urlInfo = result[0]
+    const urlInfo = result[0];
 
     const statsQuery = `
       SELECT 
         COUNT(*) AS totalChecks,
         SUM(status_code BETWEEN 200 AND 399) AS upChecks,
         SUM(status_code NOT BETWEEN 200 AND 399) AS downChecks,
-        AVG(response_time_ms) AS avgResponse
+        AVG(response_time_ms) AS avgResponse,
+        MIN(checked_at) AS firstCheck
       FROM url_logs
       WHERE url_id = ?
-    `
+    `;
 
-    // Build logs query dynamically based on filters
-    let logsQuery  = `
+    let logsQuery = `
       SELECT status_code, response_time_ms, error_message, checked_at
       FROM url_logs
       WHERE url_id = ?
-    `
-    const logsParams = [url_id]
+    `;
+    const logsParams = [url_id];
 
     if (fromDate) {
-      logsQuery += ` AND checked_at >= ?`
-      logsParams.push(`${fromDate} 00:00:00`)
+      logsQuery += ` AND checked_at >= ?`;
+      logsParams.push(`${fromDate} 00:00:00`);
     }
 
     if (toDate) {
-      logsQuery += ` AND checked_at <= ?`
-      logsParams.push(`${toDate} 23:59:59`)
+      logsQuery += ` AND checked_at <= ?`;
+      logsParams.push(`${toDate} 23:59:59`);
     }
 
-    logsQuery += ` ORDER BY checked_at DESC LIMIT ?`
-    logsParams.push(limit)
+    logsQuery += ` ORDER BY checked_at DESC LIMIT ?`;
+    logsParams.push(limit);
 
     db.query(statsQuery, [url_id], (err, statsResult) => {
-      if (err) return res.status(500).json({ message: "Error fetching stats." })
+      if (err) return res.status(500).json({ message: "Error fetching stats." });
 
-      const stats  = statsResult[0]
+      const stats = statsResult[0];
       const uptime = stats.totalChecks > 0
         ? ((stats.upChecks / stats.totalChecks) * 100).toFixed(2)
-        : 0
+        : 0;
 
       db.query(logsQuery, logsParams, (err, logs) => {
-        if (err) return res.status(500).json({ message: "Error fetching logs." })
+        if (err) return res.status(500).json({ message: "Error fetching logs." });
+
+        // ── Smart Insights Logic ──
+        let insight = null;
+        if (logs.length > 0 && stats.firstCheck) {
+          const firstLogTime = new Date(stats.firstCheck).getTime();
+          const now = Date.now();
+          const hoursPassed = (now - firstLogTime) / (1000 * 60 * 60);
+
+          // Stall insights for the first 24 hours
+          if (hoursPassed >= 24 && logs.length >= 3 && stats.avgResponse) {
+            // Compare last response vs avg
+            const lastResponse = logs[0].response_time_ms;
+            if (lastResponse < stats.avgResponse) {
+              insight = {
+                type: 'good',
+                message: `Response time improved to ${lastResponse}ms (avg ${Math.round(stats.avgResponse)}ms)`
+              };
+            } else if (lastResponse > stats.avgResponse) {
+              insight = {
+                type: 'warning',
+                message: `Response time slowed to ${lastResponse}ms (avg ${Math.round(stats.avgResponse)}ms)`
+              };
+            } else {
+              insight = {
+                type: 'neutral',
+                message: `Response time stable at ${lastResponse}ms`
+              };
+            }
+          }
+        }
 
         return res.status(200).json({
           url: { id: urlInfo.id, name: urlInfo.name, url: urlInfo.url },
           stats: {
-            totalChecks:  stats.totalChecks,
-            upChecks:     stats.upChecks,
-            downChecks:   stats.downChecks,
+            totalChecks: stats.totalChecks,
+            upChecks: stats.upChecks,
+            downChecks: stats.downChecks,
             uptime,
-            avgResponse:  Math.round(stats.avgResponse || 0),
+            avgResponse: Math.round(stats.avgResponse || 0),
           },
+          insight,
           logs,
-        })
-      })
-    })
-  })
-}
-
+        });
+      });
+    });
+  });
+};
 // 3️⃣ GET MONTHLY ANALYTICS
 const getMonthlyStats = (req, res) => {
   const user_id = req.user.id;
@@ -132,9 +162,30 @@ const getMonthlyStats = (req, res) => {
     return res.status(200).json({ stats });
   });
 };
+// Monitor Traffic Analytics
+const logTraffic = async (req, res) => {
+  const { url_id, timestamp, referrer, user_agent } = req.body;
 
+  if (!url_id) {
+    return res.status(400).json({ message: "url_id is required" });
+  }
+
+  const query = `
+    INSERT INTO traffic_logs (url_id, timestamp, referrer, user_agent)
+    VALUES (?, ?, ?, ?)
+  `;
+
+  db.query(query, [url_id, timestamp || new Date(), referrer || null, user_agent || null], (err) => {
+    if (err) {
+      console.error("Traffic log insert error:", err);
+      return res.status(500).json({ message: "Failed to log traffic" });
+    }
+
+    res.status(200).json({ message: "Traffic logged successfully" });
+  });
+}
 module.exports = {
   getDashboard,
   getUrlLogs,
-  getMonthlyStats
+  getMonthlyStats,
 };

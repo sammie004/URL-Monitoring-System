@@ -52,7 +52,7 @@ const authMiddleware = (req, res, next) => {
         if (error.name === "JsonWebTokenError") {
             return res.status(401).json({
                 message: "Invalid token."
-            });
+            },error);
         }
 
         return res.status(500).json({
