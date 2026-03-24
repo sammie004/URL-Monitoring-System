@@ -31,45 +31,79 @@ const getDashboard = (req, res) => {
 
 
 
-// 2️⃣ GET RECENT LOGS FOR A URL
 const getUrlLogs = (req, res) => {
   const { url_id } = req.params;
-  const user_id = req.user.id;
+  const user_id    = req.user.id;
 
-  // Ensure user owns this URL
-  const checkQuery = `SELECT id FROM urls WHERE id = ? AND user_id = ?`;
+  // Pull filter params from query string
+  const limit    = parseInt(req.query.limit)    || 100
+  const fromDate = req.query.from || null  // e.g. "2026-03-01"
+  const toDate   = req.query.to   || null  // e.g. "2026-03-24"
 
+  const checkQuery = `SELECT id, name, url FROM urls WHERE id = ? AND user_id = ?`
   db.query(checkQuery, [url_id, user_id], (err, result) => {
-    if (err) {
-      console.log("Ownership check error:", err);
-      return res.status(500).json({ message: "Error checking URL ownership." });
-    }
+    if (err) return res.status(500).json({ message: "Error checking URL ownership." })
+    if (result.length === 0) return res.status(403).json({ message: "Unauthorized access." })
 
-    if (result.length === 0) {
-      return res.status(403).json({ message: "Unauthorized access." });
-    }
+    const urlInfo = result[0]
 
-    // Fetch logs
-    const logsQuery = `
+    const statsQuery = `
+      SELECT 
+        COUNT(*) AS totalChecks,
+        SUM(status_code BETWEEN 200 AND 399) AS upChecks,
+        SUM(status_code NOT BETWEEN 200 AND 399) AS downChecks,
+        AVG(response_time_ms) AS avgResponse
+      FROM url_logs
+      WHERE url_id = ?
+    `
+
+    // Build logs query dynamically based on filters
+    let logsQuery  = `
       SELECT status_code, response_time_ms, error_message, checked_at
       FROM url_logs
       WHERE url_id = ?
-      ORDER BY checked_at DESC
-      LIMIT 10
-    `;
+    `
+    const logsParams = [url_id]
 
-    db.query(logsQuery, [url_id], (err, logs) => {
-      if (err) {
-        console.log("Logs fetch error:", err);
-        return res.status(500).json({ message: "Error fetching logs." });
-      }
+    if (fromDate) {
+      logsQuery += ` AND checked_at >= ?`
+      logsParams.push(`${fromDate} 00:00:00`)
+    }
 
-      return res.status(200).json({ logs });
-    });
-  });
-};
+    if (toDate) {
+      logsQuery += ` AND checked_at <= ?`
+      logsParams.push(`${toDate} 23:59:59`)
+    }
 
+    logsQuery += ` ORDER BY checked_at DESC LIMIT ?`
+    logsParams.push(limit)
 
+    db.query(statsQuery, [url_id], (err, statsResult) => {
+      if (err) return res.status(500).json({ message: "Error fetching stats." })
+
+      const stats  = statsResult[0]
+      const uptime = stats.totalChecks > 0
+        ? ((stats.upChecks / stats.totalChecks) * 100).toFixed(2)
+        : 0
+
+      db.query(logsQuery, logsParams, (err, logs) => {
+        if (err) return res.status(500).json({ message: "Error fetching logs." })
+
+        return res.status(200).json({
+          url: { id: urlInfo.id, name: urlInfo.name, url: urlInfo.url },
+          stats: {
+            totalChecks:  stats.totalChecks,
+            upChecks:     stats.upChecks,
+            downChecks:   stats.downChecks,
+            uptime,
+            avgResponse:  Math.round(stats.avgResponse || 0),
+          },
+          logs,
+        })
+      })
+    })
+  })
+}
 
 // 3️⃣ GET MONTHLY ANALYTICS
 const getMonthlyStats = (req, res) => {

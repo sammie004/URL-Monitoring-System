@@ -17,8 +17,8 @@ const cron = require("node-cron");
 const db   = require("../config/db");
 
 const { sendEmail }             = require("../services/Email");
-const { generateDownAlertEmail} = require("../Templates/DownTime");
-const { generateRecoveryEmail } = require("../Templates/UpTime");
+const { generateDownAlertEmail} = require("../Templates/DownAlertEmail");
+const { generateRecoveryEmail } = require("../Templates/RecoveryEmail");
 const { generateDigestEmail }   = require("../Templates/DigestEmail");
 
 // ─── Logger ───────────────────────────────────────────────────────────────────
@@ -211,6 +211,18 @@ async function processUrl({ id, url, user_id, user_name, user_email }) {
     });
   }
 
+  // ── Determine if this is a noteworthy change BEFORE writing to DB ─────────
+  const isFirstCheck  = previousLog === null;
+  const statusChanged = !isFirstCheck && previousLog.status_code !== result.statusCode;
+
+  logger.info("Change detection", {
+    urlId: id, url,
+    isFirstCheck,
+    previousStatusCode: previousLog?.status_code ?? null,
+    newStatusCode:      result.statusCode,
+    statusChanged,
+  });
+
   // ── Persist log ───────────────────────────────────────────────────────────
   try {
     await query(
@@ -232,13 +244,9 @@ async function processUrl({ id, url, user_id, user_name, user_email }) {
     logger.error("Failed to update url status", { urlId: id, url, error: err.message });
   }
 
-  // ── Determine if this is a noteworthy change ──────────────────────────────
-  const isFirstCheck  = previousLog === null;
-  const statusChanged = !isFirstCheck && previousLog.status_code !== result.statusCode;
-
   if (!isFirstCheck && !statusChanged) {
     logger.debug("No change detected — skipping alert", { urlId: id, url, statusCode: result.statusCode });
-    return null; // nothing to alert about
+    return null;
   }
 
   // Return a change record to be batched at the user level
