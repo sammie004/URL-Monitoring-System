@@ -1,4 +1,5 @@
 const db = require("../config/db");
+const { get } = require("../routes/monitoring/dash");
 
 // 1️⃣ GET DASHBOARD OVERVIEW
 const getDashboard = (req, res) => {
@@ -184,8 +185,87 @@ const logTraffic = async (req, res) => {
     res.status(200).json({ message: "Traffic logged successfully" });
   });
 }
+
+// URL Uptime Calculator
+const getUptime = (req, res) => {
+  const { id } = req.params;
+
+  // Fetch 14 days of logs so we can compare last 7 days vs previous 7 days
+  const query = `
+    SELECT status_code, checked_at
+    FROM url_logs
+    WHERE url_id = ?
+    AND checked_at >= NOW() - INTERVAL 14 DAY
+    ORDER BY checked_at ASC
+  `;
+
+  db.query(query, [id], (err, logs) => {
+    if (err) {
+      console.error("Uptime fetch error:", err);
+      return res.status(500).json({ message: "Error fetching logs" });
+    }
+
+    if (!logs.length) {
+      return res.status(200).json({
+        total_checks:      0,
+        up_checks:         0,
+        downtime_checks:   0,
+        uptime_percentage: 100,
+        trend:             null,
+        change_percentage: 0,
+        period:            "last 7 days",
+      });
+    }
+
+    const now        = Date.now();
+    const day7ago    = now - 7  * 24 * 60 * 60 * 1000;
+    const day14ago   = now - 14 * 24 * 60 * 60 * 1000;
+
+    // Split logs into two windows
+    const recentLogs   = logs.filter(l => new Date(l.checked_at).getTime() >= day7ago);
+    const previousLogs = logs.filter(l => {
+      const t = new Date(l.checked_at).getTime();
+      return t >= day14ago && t < day7ago;
+    });
+
+    // Calculate uptime % for a set of logs
+    const calcUptime = (set) => {
+      if (!set.length) return null;
+      const up = set.filter(l => l.status_code >= 200 && l.status_code < 400).length;
+      return +((up / set.length) * 100).toFixed(2);
+    };
+
+    const currentUptime  = calcUptime(recentLogs)  ?? 100;
+    const previousUptime = calcUptime(previousLogs);
+
+    // Change vs previous period
+    let changePercentage = 0;
+    let trend = null; // null = not enough data for comparison
+
+    if (previousUptime !== null) {
+      changePercentage = +(currentUptime - previousUptime).toFixed(2);
+      if (changePercentage > 0)      trend = 'up';
+      else if (changePercentage < 0) trend = 'down';
+      else                           trend = 'neutral';
+    }
+
+    const upChecks = recentLogs.filter(l => l.status_code >= 200 && l.status_code < 400).length;
+
+    return res.status(200).json({
+      total_checks:      recentLogs.length,
+      up_checks:         upChecks,
+      downtime_checks:   recentLogs.length - upChecks,
+      uptime_percentage: currentUptime,
+      previous_uptime:   previousUptime,
+      trend,             // 'up' | 'down' | 'neutral' | null
+      change_percentage: changePercentage,
+      period:            "last 7 days",
+    });
+  });
+};
 module.exports = {
   getDashboard,
   getUrlLogs,
   getMonthlyStats,
+  getUptime
 };
