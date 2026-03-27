@@ -94,26 +94,28 @@ const handleRedirect = async (req, res) => {
 // ─── POST /api/traffic/wrap ───────────────────────────────────────────────────
 // Creates or returns a wrapped link for a URL
 const createWrappedLink = async (req, res) => {
-  const user_id    = req.user.id;
+  const user_id = req.user?.id || 1; // TEMP for testing
   const { url_id } = req.body;
 
   if (!url_id) return res.status(400).json({ message: "url_id is required" });
 
+  console.log('Creating wrapped link for user:', user_id, 'url_id:', url_id);
+
   try {
     const rows = await query(
-      "SELECT id, url FROM urls WHERE id = ? AND user_id = ?",
+      "SELECT * FROM urls WHERE id = ? AND user_id = ?",
       [url_id, user_id]
     );
-    if (rows.length === 0) return res.status(403).json({ message: "Unauthorized" });
+    if (rows.length === 0)
+      return res.status(404).json({ message: "URL not found or not yours" });
 
-    // Return existing wrapped link if already created
     const existing = await query(
       "SELECT short_code FROM wrapped_links WHERE url_id = ?",
       [url_id]
     );
     if (existing.length > 0) {
       return res.status(200).json({
-        short_code:  existing[0].short_code,
+        short_code: existing[0].short_code,
         wrapped_url: `${process.env.BASE_URL}/go/${existing[0].short_code}`,
       });
     }
@@ -132,9 +134,7 @@ const createWrappedLink = async (req, res) => {
     console.error("Create wrapped link error:", err.message);
     return res.status(500).json({ message: "Failed to create wrapped link" });
   }
-};
-
-// ─── GET /api/dashboard/traffic/:url_id ──────────────────────────────────────
+};// ─── GET /api/dashboard/traffic/:url_id ──────────────────────────────────────
 // Returns aggregated traffic data — daily visits, peak hours, summary
 const getTrafficData = async (req, res) => {
   const user_id    = req.user.id;
