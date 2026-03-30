@@ -3,13 +3,11 @@
 const db     = require("../config/db");
 const crypto = require("crypto");
 
-// ─── Helper ───────────────────────────────────────────────────────────────────
 const query = (sql, params = []) =>
   new Promise((resolve, reject) =>
     db.query(sql, params, (err, results) => (err ? reject(err) : resolve(results)))
   );
 
-// Hash IP + UA + date — privacy-safe unique visitor detection, no raw IPs stored
 const visitorHash = (ip, ua, date) =>
   crypto.createHash("sha256").update(`${ip}|${ua}|${date}`).digest("hex");
 
@@ -20,22 +18,17 @@ const logTraffic = async (req, res) => {
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
   if (req.method === "OPTIONS") return res.sendStatus(204);
 
-  const { url_id } = req.params; // ✅ KEEP IT SIMPLE
-  console.log("PARAMS:", req.params);
-  const referrer   = req.body?.referrer || req.headers.referer || null;
-  const userAgent  = req.body?.user_agent || req.headers["user-agent"] || null;
-
-  const ip =
-    req.headers["x-forwarded-for"]?.split(",")[0].trim() ||
-    req.socket.remoteAddress ||
-    "unknown";
+  const { url_id }  = req.params;
+  const referrer    = req.body?.referrer   || req.headers.referer       || null;
+  const userAgent   = req.body?.user_agent || req.headers["user-agent"] || null;
+  const ip          = req.headers["x-forwarded-for"]?.split(",")[0].trim()
+                      || req.socket.remoteAddress || "unknown";
 
   if (!url_id) return res.status(400).json({ message: "url_id is required" });
 
   try {
     const rows = await query("SELECT id FROM urls WHERE id = ?", [url_id]);
-    if (rows.length === 0)
-      return res.status(404).json({ message: "URL not found" });
+    if (rows.length === 0) return res.status(404).json({ message: "URL not found" });
 
     const today = new Date().toISOString().slice(0, 10);
     const hash  = visitorHash(ip, userAgent || "", today);
@@ -54,9 +47,17 @@ const logTraffic = async (req, res) => {
 };
 
 // ─── GET /go/:short_code ──────────────────────────────────────────────────────
-// Link wrapping redirect — logs the visit then immediately redirects
+// ✅ Fix: deduplicate using a short in-memory set per short_code + IP + minute
+//    This prevents double-logging from browser prefetch, favicon requests etc.
+const recentRedirects = new Map()
+
 const handleRedirect = async (req, res) => {
   const { short_code } = req.params;
+
+  // ✅ Ignore favicon and asset requests that accidentally hit this route
+  if (short_code === 'favicon.ico' || short_code.includes('.')) {
+    return res.status(404).send('Not found')
+  }
 
   try {
     const rows = await query(
@@ -77,6 +78,20 @@ const handleRedirect = async (req, res) => {
     const today     = new Date().toISOString().slice(0, 10);
     const hash      = visitorHash(ip, userAgent || "", today);
 
+    // ✅ Dedup key: hash + short_code + current minute
+    //    Prevents double-logging if browser fires two requests within the same minute
+    const minute   = new Date().toISOString().slice(0, 16) // "2026-03-25T10:42"
+    const dedupKey = `${hash}:${short_code}:${minute}`
+
+    if (recentRedirects.has(dedupKey)) {
+      // Already logged this exact visitor + link + minute — just redirect
+      return res.redirect(302, url)
+    }
+
+    // Mark as seen for 90 seconds then clean up
+    recentRedirects.set(dedupKey, true)
+    setTimeout(() => recentRedirects.delete(dedupKey), 90_000)
+
     // Fire and forget — don't block the redirect
     query(
       `INSERT INTO traffic_logs (url_id, timestamp, referrer, user_agent, visitor_hash, source)
@@ -92,22 +107,18 @@ const handleRedirect = async (req, res) => {
 };
 
 // ─── POST /api/traffic/wrap ───────────────────────────────────────────────────
-// Creates or returns a wrapped link for a URL
 const createWrappedLink = async (req, res) => {
-  const user_id = req.user?.id || 1; // TEMP for testing
+  const user_id    = req.user.id;
   const { url_id } = req.body;
 
   if (!url_id) return res.status(400).json({ message: "url_id is required" });
 
-  console.log('Creating wrapped link for user:', user_id, 'url_id:', url_id);
-
   try {
     const rows = await query(
-      "SELECT * FROM urls WHERE id = ? AND user_id = ?",
+      "SELECT id, url FROM urls WHERE id = ? AND user_id = ?",
       [url_id, user_id]
     );
-    if (rows.length === 0)
-      return res.status(404).json({ message: "URL not found or not yours" });
+    if (rows.length === 0) return res.status(403).json({ message: "Unauthorized" });
 
     const existing = await query(
       "SELECT short_code FROM wrapped_links WHERE url_id = ?",
@@ -115,7 +126,7 @@ const createWrappedLink = async (req, res) => {
     );
     if (existing.length > 0) {
       return res.status(200).json({
-        short_code: existing[0].short_code,
+        short_code:  existing[0].short_code,
         wrapped_url: `${process.env.BASE_URL}/go/${existing[0].short_code}`,
       });
     }
@@ -134,8 +145,9 @@ const createWrappedLink = async (req, res) => {
     console.error("Create wrapped link error:", err.message);
     return res.status(500).json({ message: "Failed to create wrapped link" });
   }
-};// ─── GET /api/dashboard/traffic/:url_id ──────────────────────────────────────
-// Returns aggregated traffic data — daily visits, peak hours, summary
+};
+
+// ─── GET /api/dashboard/traffic/:url_id ──────────────────────────────────────
 const getTrafficData = async (req, res) => {
   const user_id    = req.user.id;
   const { url_id } = req.params;
@@ -155,7 +167,6 @@ const getTrafficData = async (req, res) => {
     if (toDate)   { dateFilter += " AND timestamp <= ?"; p.push(`${toDate} 23:59:59`); }
 
     const [dailyVisits, peakHours, summary, sources] = await Promise.all([
-      // Daily visits — total + unique per day
       query(
         `SELECT
            DATE(timestamp)              AS date,
@@ -167,7 +178,6 @@ const getTrafficData = async (req, res) => {
          ORDER BY date ASC`,
         p
       ),
-      // Peak hours 0-23
       query(
         `SELECT
            HOUR(timestamp) AS hour,
@@ -178,17 +188,15 @@ const getTrafficData = async (req, res) => {
          ORDER BY hour ASC`,
         p
       ),
-      // Overall summary
       query(
         `SELECT
-           COUNT(*)                     AS totalVisits,
-           COUNT(DISTINCT visitor_hash) AS uniqueVisitors,
+           COUNT(*)                        AS totalVisits,
+           COUNT(DISTINCT visitor_hash)    AS uniqueVisitors,
            COUNT(DISTINCT DATE(timestamp)) AS activeDays
          FROM traffic_logs
          WHERE url_id = ? ${dateFilter}`,
         p
       ),
-      // Source breakdown: script embed vs wrapped link
       query(
         `SELECT
            COALESCE(source, 'script') AS source,
@@ -212,7 +220,6 @@ const getTrafficData = async (req, res) => {
   }
 };
 
-// Always return 24 hourly buckets even if some have 0 visits
 const buildFullDayArray = (rows) => {
   const map = Object.fromEntries(rows.map(r => [r.hour, r.visits]));
   return Array.from({ length: 24 }, (_, h) => ({
@@ -222,8 +229,7 @@ const buildFullDayArray = (rows) => {
   }));
 };
 
-// ─── GET /api/snippet/:url_id ─────────────────────────────────────────────────
-// Serves the tracker JS — used as a <script src> tag
+// ─── GET /api/traffic/snippet/:url_id ────────────────────────────────────────
 const serveSnippet = async (req, res) => {
   const { url_id } = req.params;
 
