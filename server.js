@@ -8,6 +8,7 @@ dotenv.config();
 
 // DB
 const db = require("./config/db");
+require('./cron-job')
 
 // routes
 const userAuthRoutes = require("./routes/users/authentication");
