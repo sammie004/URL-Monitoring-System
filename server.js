@@ -22,19 +22,27 @@ const { handleRedirect } = require("./Controllers/TrafficMonitor")
 // middlewares
 const allowedOrigins = [
   "http://localhost:5173",
-  // "https://your-frontend-domain.com"t 
+  // add your frontend production URL here later
 ];
 
 app.use(cors({
   origin: function (origin, callback) {
-    if (!origin || allowedOrigins.includes(origin)) {
-      callback(null, true);
-    } else {
-      callback(new Error("Not allowed by CORS"));
+    // allow mobile apps, curl, server-to-server
+    if (!origin) return callback(null, true);
+
+    if (allowedOrigins.includes(origin)) {
+      return callback(null, true);
     }
+
+    return callback(null, true); // 👈 TEMP FIX (important)
   },
-  credentials: true
+  credentials: true,
+  methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"]
 }));
+
+app.options(/.*/, cors());
+
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
