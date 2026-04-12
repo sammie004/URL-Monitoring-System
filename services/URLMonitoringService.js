@@ -16,7 +16,7 @@ console.log("✅ URLMonitoringService version: BATCHED_DIGEST_ALERTS");
 const cron = require("node-cron");
 const db   = require("../config/db");
 
-const { sendEmail }             = require("../services/Email");
+// const { sendEmail }             = require("../services/MailSending");
 const { generateDownAlertEmail} = require("../Templates/DownTime");
 const { generateRecoveryEmail } = require("../Templates/UpTime");
 const { generateDigestEmail }   = require("../Templates/DigestEmail");
@@ -45,9 +45,9 @@ const logger = {
 // ─── Config ───────────────────────────────────────────────────────────────────
 
 const CONFIG = {
-  FETCH_TIMEOUT_MS:    parseInt(process.env.MONITOR_TIMEOUT_MS)      || 10_000,
-  MAX_RETRIES:         parseInt(process.env.MONITOR_MAX_RETRIES)      || 2,
-  RETRY_DELAY_MS:      parseInt(process.env.MONITOR_RETRY_DELAY_MS)   || 1_500,
+  FETCH_TIMEOUT_MS:    parseInt(process.env.MONITOR_TIMEOUT_MS)      || 5_000,
+  MAX_RETRIES:         parseInt(process.env.MONITOR_MAX_RETRIES)      || 1,
+  RETRY_DELAY_MS:      parseInt(process.env.MONITOR_RETRY_DELAY_MS)   || 1_000,
   CONCURRENCY_LIMIT:   parseInt(process.env.MONITOR_CONCURRENCY)      || 10,
   CRON_SCHEDULE:       process.env.MONITOR_CRON                       || "*/1 * * * *",
   CIRCUIT_BREAK_AFTER: parseInt(process.env.MONITOR_CIRCUIT_BREAK)    || 5,
@@ -368,48 +368,58 @@ const monitorUrls = async () => {
 
   isRunning = true;
   const jobStart = Date.now();
+
+  // Hard timeout — force-reset if job hangs for more than 2 minutes
+  const hardTimeout = setTimeout(() => {
+    logger.error("Monitor job hard timeout — force resetting isRunning");
+    isRunning = false;
+  }, 2 * 60 * 1000);
+
   logger.info("Monitor job started", { schedule: CONFIG.CRON_SCHEDULE });
 
-  let urls;
   try {
-    urls = await query(`
-      SELECT
-        u.id,
-        u.url,
-        u.user_id,
-        usr.name  AS user_name,
-        usr.email AS user_email
-      FROM urls u
-      INNER JOIN users usr ON usr.id = u.user_id
-    `);
+    let urls;
+    try {
+      urls = await query(`
+        SELECT
+          u.id,
+          u.url,
+          u.user_id,
+          usr.name  AS user_name,
+          usr.email AS user_email
+        FROM urls u
+        INNER JOIN users usr ON usr.id = u.user_id
+      `);
+    } catch (err) {
+      logger.error("Failed to fetch URLs from DB", { error: err.message });
+      return;
+    }
+
+    if (!urls.length) {
+      logger.info("No active URLs to monitor");
+      return;
+    }
+
+    logger.info("Starting URL checks", { count: urls.length, concurrency: CONFIG.CONCURRENCY_LIMIT });
+
+    urls.forEach(({ id, url, user_name, user_email }) => {
+      logger.info("Queued for check", { urlId: id, url, owner_name: user_name, owner_email: user_email });
+    });
+
+    const changes = await runWithConcurrency(urls, CONFIG.CONCURRENCY_LIMIT, processUrl);
+    sendAlertsForTick(changes).catch(err =>
+  logger.error("Alert dispatch failed", { error: err.message })
+);
+
+    const duration = Date.now() - jobStart;
+    logger.info("Monitor job complete", { duration: `${duration}ms`, checked: urls.length });
+
   } catch (err) {
-    logger.error("Failed to fetch URLs from DB", { error: err.message });
+    logger.error("Unexpected error in monitor job", { error: err.message });
+  } finally {
+    clearTimeout(hardTimeout);
     isRunning = false;
-    return;
   }
-
-  if (!urls.length) {
-    logger.info("No active URLs to monitor");
-    isRunning = false;
-    return;
-  }
-
-  logger.info("Starting URL checks", { count: urls.length, concurrency: CONFIG.CONCURRENCY_LIMIT });
-
-  urls.forEach(({ id, url, user_name, user_email }) => {
-    logger.info("Queued for check", { urlId: id, url, owner_name: user_name, owner_email: user_email });
-  });
-
-  // Check all URLs, collect change records
-  const changes = await runWithConcurrency(urls, CONFIG.CONCURRENCY_LIMIT, processUrl);
-
-  // Send emails grouped by user
-  await sendAlertsForTick(changes);
-
-  const duration = Date.now() - jobStart;
-  logger.info("Monitor job complete", { duration: `${duration}ms`, checked: urls.length });
-
-  isRunning = false;
 };
 
 // ─── Scheduler ────────────────────────────────────────────────────────────────
